@@ -46,9 +46,7 @@ Do not commit the .env file to GitHub.
 
 Installation
 
-Clone the repository:
-
-git clone https://github.com/your-username/Telebot.git
+clone the repository
 cd Telebot
 
 
