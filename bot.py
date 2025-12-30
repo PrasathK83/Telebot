@@ -9,6 +9,8 @@ from telegram.ext import (
 from dotenv import load_dotenv
 from groq import Groq
 import os
+import sys
+print(sys.version)
 
 # Load environment variables
 load_dotenv()
@@ -84,3 +86,4 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_with_ai))
 if __name__ == "__main__":
     print("TeleBot is running...")
     app.run_polling()
+
