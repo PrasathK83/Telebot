@@ -5,9 +5,7 @@ if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import os
-import json
 import re
-import subprocess
 from collections import deque
 from dotenv import load_dotenv
 
@@ -22,6 +20,7 @@ from telegram.ext import (
 )
 
 from groq import Groq
+from weather import fetch_weather
 
 # ------------------ ENV ------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,28 +51,7 @@ def get_user_memory(user_id: int) -> deque:
 def reset_user_memory(user_id: int):
     conversation_memory.pop(user_id, None)
 
-# ------------------ WEATHER SERVICE ------------------
-def call_weather_service_sync(city: str) -> str:
-    try:
-        proc = subprocess.Popen(
-            ["python", "weather.py"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        proc.stdin.write(json.dumps({"city": city}) + "\n")
-        proc.stdin.flush()
-
-        output = proc.stdout.readline()
-        proc.kill()
-
-        return json.loads(output).get("result", "Weather service error")
-
-    except Exception:
-        return "Weather service unavailable."
-
+# ------------------ WEATHER NLP ------------------
 WEATHER_KEYWORDS = {
     "weather", "rain", "raining", "umbrella", "temperature",
     "hot", "cold", "cloudy", "forecast", "storm", "wind", "humidity"
@@ -123,11 +101,11 @@ Security:
   "That information is hidden due to security policies."
 """
 
-# ------------------ HANDLERS ------------------
+# ------------------ COMMAND HANDLERS ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello 👋\n"
-        "Ask me weather questions naturally.\n\n"
+        "Ask me weather questions naturally 🌦\n\n"
         "Commands:\n"
         "/weather <city>\n"
         "/reset"
@@ -135,7 +113,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_user_memory(update.effective_user.id)
-    await update.message.reply_text("Conversation history reset.")
+    await update.message.reply_text("✅ Conversation history reset.")
 
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city = " ".join(context.args)
@@ -144,9 +122,10 @@ async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, call_weather_service_sync, city)
+    result = await loop.run_in_executor(None, fetch_weather, city)
     await update.message.reply_text(result)
 
+# ------------------ CHAT HANDLER ------------------
 async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text.strip()
     user_id = update.effective_user.id
@@ -166,9 +145,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_weather_query(user_message):
         city = extract_city(user_message)
         if city:
-            weather = await loop.run_in_executor(
-                None, call_weather_service_sync, city
-            )
+            weather = await loop.run_in_executor(None, fetch_weather, city)
             messages.append({
                 "role": "system",
                 "content": f"REAL-TIME WEATHER DATA:\n{weather}"
@@ -191,7 +168,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply)
 
-# ------------------ FASTAPI APP ------------------
+# ------------------ FASTAPI WEBHOOK ------------------
 app = FastAPI()
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
@@ -204,11 +181,11 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_ha
 async def on_startup():
     await telegram_app.initialize()
     await telegram_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-    print("✅ Webhook set")
+    print("✅ Telegram webhook registered")
 
 @app.post("/webhook")
-async def telegram_webhook(req: Request):
-    data = await req.json()
+async def telegram_webhook(request: Request):
+    data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return {"ok": True}
