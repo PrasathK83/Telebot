@@ -312,8 +312,9 @@ async def chat_handler(
     })
 
     await update.message.reply_text(
-        reply
-    )
+    reply,
+    parse_mode="Markdown"
+)
 
 
 # ------------------ FASTAPI ------------------
