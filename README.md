@@ -1,82 +1,231 @@
-TeleBot – AI Telegram Bot using Groq (LLaMA 3)
+# AI Weather Telegram Bot
 
-TeleBot is an AI-powered Telegram chatbot built using python-telegram-bot and Groq’s LLaMA 3.3 70B Versatile model.
-It allows users to interact with an AI assistant directly through Telegram using simple text messages.
+A Telegram chatbot built with Python that provides real-time weather information and AI-powered responses using Groq and OpenWeatherMap APIs.
 
-Features
+## Features
 
-AI-powered chat using Groq’s LLaMA 3.3 70B model
+* Real-time weather information
+* Natural language weather queries
+* Telegram bot integration
+* AI responses using Groq LLM
+* Short-term conversation memory
+* Weather command using `/weather <city>`
+* Conversation reset using `/reset`
+* FastAPI webhook
+* Environment variable based API key management
 
-Asynchronous Telegram bot using python-telegram-bot v20+
+## Technologies Used
 
-Command-based interaction (/start, /help, /content)
+* Python
+* FastAPI
+* python-telegram-bot
+* Groq
+* OpenWeatherMap API
+* Requests
+* python-dotenv
+* asyncio
 
-Secure configuration using environment variables
+## Project Structure
 
-Suitable for cloud deployment (Render, Railway, VPS, etc.)
+```text
+project/
+│
+├── main.py
+├── weather.py
+├── requirements.txt
+├── .env
+├── .gitignore
+└── README.md
+```
 
-Tech Stack
+## Environment Variables
 
-Python 3.11
+Create a `.env` file:
 
-python-telegram-bot 20.7
-
-Groq Python SDK
-
-python-dotenv
-
-
-Prerequisites
-
-Python 3.10 or 3.11
-
-A Telegram Bot Token (from BotFather)
-
-A Groq API Key
-
-Environment Variables
-
-Create a .env file in the project root and add:
-
-TOKEN=your_telegram_bot_token
+```env
+BOT_TOKEN=your_telegram_bot_token
 GROQ_API_KEY=your_groq_api_key
+OPENWEATHER_API_KEY=your_openweather_api_key
+WEBHOOK_URL=https://your-domain.com
+```
 
+Do not upload the `.env` file to GitHub.
 
-Do not commit the .env file to GitHub.
+## Installation
 
-Installation
+Clone the repository:
 
-clone the repository
-cd Telebot
-
+```bash
+git clone https://github.com/your-username/your-repository.git
+cd your-repository
+```
 
 Create a virtual environment:
 
-python -m venv venv
-source venv/bin/activate   # On Windows: venv\Scripts\activate
+```bash
+python -m venv .venv
+```
 
+Activate the environment on Windows:
 
-Install dependencies:
+```bash
+.venv\Scripts\activate
+```
 
+Install the dependencies:
+
+```bash
 pip install -r requirements.txt
+```
 
-Running the Bot Locally
+## Run the Project
 
-Start the bot with:
+Start the FastAPI server:
 
-python bot.py
+```bash
+uvicorn main:app --reload
+```
 
+For Telegram webhooks, the application needs a publicly accessible HTTPS URL.
 
-If everything is configured correctly, you should see:
+Set the URL in `.env`:
 
-TeleBot is running...
+```env
+WEBHOOK_URL=https://your-domain.com
+```
 
-Available Commands
+The webhook endpoint will be:
 
-/start – Start the bot
+```text
+https://your-domain.com/webhook
+```
 
-/help – Show help information
+## Bot Commands
 
-/content – Information about the AI model
+### Start
 
-Any text message – Chat with the AI
+```text
+/start
+```
+
+Displays the available commands.
+
+### Weather
+
+```text
+/weather Chennai
+```
+
+Returns the current weather information for the specified city.
+
+### Reset
+
+```text
+/reset
+```
+
+Clears the user's conversation history.
+
+## Natural Language Queries
+
+The bot can understand messages such as:
+
+```text
+What's the weather in Chennai?
+```
+
+```text
+Will it rain in Coimbatore?
+```
+
+```text
+What is the temperature in Madurai?
+```
+
+The bot detects weather-related queries, extracts the city, retrieves real-time weather data, and provides the information through the AI assistant.
+
+## Weather Information
+
+The weather service retrieves:
+
+* Temperature
+* Humidity
+* Weather condition
+* Rain expectation
+
+## Conversation Memory
+
+The bot stores a limited number of recent messages for each Telegram user.
+
+The `/reset` command can be used to clear the stored conversation history.
+
+The conversation memory is stored in application memory, so it will be cleared when the application restarts.
+
+## API Flow
+
+```text
+Telegram User
+      |
+      v
+Telegram Bot
+      |
+      v
+FastAPI Webhook
+      |
+      v
+Message Handler
+      |
+      +------------------+
+      |                  |
+      v                  v
+Weather Query        Normal Query
+      |                  |
+      v                  v
+OpenWeatherMap          Groq
+      |                  |
+      +--------+---------+
+               |
+               v
+          Bot Response
+               |
+               v
+         Telegram User
+```
+
+## Requirements
+
+Example `requirements.txt`:
+
+```text
+fastapi
+uvicorn
+python-telegram-bot
+groq
+python-dotenv
+requests
+```
+
+## Security
+
+API keys and bot tokens are stored in environment variables.
+
+Add the following to `.gitignore`:
+
+```text
+.env
+.venv/
+__pycache__/
+*.pyc
+```
+
+Never commit API keys, bot tokens, or other secrets to GitHub.
+
+## Future Improvements
+
+* Weather forecast
+* Weather alerts
+* Telegram location sharing
+* Persistent conversation memory
+* Multi-language support
+* Better city detection
+* Weather history
