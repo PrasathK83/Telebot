@@ -61,10 +61,21 @@ groq_client = Groq(
 
 
 # ------------------ OCR SETUP ------------------
+# EasyOCR model loading is slow (downloads + loads torch models). Doing this
+# at import time blocks uvicorn from binding the port, which makes Render's
+# port scan time out. So we lazy-load it on first use instead, inside a
+# thread executor.
 
-print("Loading EasyOCR...")
-ocr_reader = easyocr.Reader(["en"], gpu=False)
-print("EasyOCR loaded successfully.")
+ocr_reader = None
+
+
+def get_ocr_reader():
+    global ocr_reader
+    if ocr_reader is None:
+        print("Loading EasyOCR (first use)...")
+        ocr_reader = easyocr.Reader(["en"], gpu=False)
+        print("EasyOCR loaded successfully.")
+    return ocr_reader
 
 
 # ------------------ MEMORY ------------------
@@ -239,7 +250,8 @@ def prepare_ocr_images(image: Image.Image):
 
 def run_easyocr(image: Image.Image):
     image_array = np.array(image)
-    return ocr_reader.readtext(
+    reader = get_ocr_reader()
+    return reader.readtext(
         image_array,
         detail=1,
         paragraph=False,
