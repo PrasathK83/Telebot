@@ -8,13 +8,8 @@ import os
 import re
 import tempfile
 from collections import deque
-from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from reminders import init_scheduler, extract_event, schedule_reminders, parse_reminder_command
-
-from fastapi import FastAPI, Request, Response
-import uvicorn
-
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -27,10 +22,7 @@ from telegram.ext import (
 
 from groq import Groq
 from weather import fetch_weather
-
-from PIL import Image, ImageOps, ImageEnhance
-import easyocr
-import numpy as np
+from ocr import extract_text_from_image
 
 
 # ------------------ ENV ------------------
@@ -40,37 +32,22 @@ load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional, recommended
 
 if BOT_TOKEN:
     BOT_TOKEN = BOT_TOKEN.strip().strip('"').strip("'")
 if GROQ_API_KEY:
     GROQ_API_KEY = GROQ_API_KEY.strip().strip('"').strip("'")
-if WEBHOOK_URL:
-    WEBHOOK_URL = WEBHOOK_URL.strip().strip('"').strip("'").rstrip("/")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY missing")
-if not WEBHOOK_URL:
-    raise RuntimeError("WEBHOOK_URL missing")
-
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
 groq_client = Groq(
     api_key=GROQ_API_KEY,
     timeout=20.0,
     max_retries=1,
 )
-
-
-# ------------------ OCR SETUP ------------------
-
-print("Loading EasyOCR...")
-ocr_reader = easyocr.Reader(["en"], gpu=False)
-print("EasyOCR loaded successfully.")
 
 
 # ------------------ MEMORY ------------------
@@ -221,133 +198,6 @@ async def safe_reply(message, text: str):
         await message.reply_text(text)
 
 
-# ------------------ OCR PIPELINE (from OCR bot) ------------------
-
-def prepare_ocr_images(image: Image.Image):
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    original_width, original_height = image.size
-    max_dimension = 1800
-    largest_dimension = max(original_width, original_height)
-
-    if largest_dimension > max_dimension:
-        scale = max_dimension / largest_dimension
-        new_size = (
-            max(1, int(original_width * scale)),
-            max(1, int(original_height * scale)),
-        )
-        image = image.resize(new_size, Image.Resampling.LANCZOS)
-    else:
-        min_dimension = 1100
-        if largest_dimension < min_dimension:
-            scale = min_dimension / largest_dimension
-            new_size = (
-                max(1, int(original_width * scale)),
-                max(1, int(original_height * scale)),
-            )
-            image = image.resize(new_size, Image.Resampling.LANCZOS)
-
-    original = image.copy()
-    gray = ImageOps.grayscale(image)
-    gray = ImageEnhance.Contrast(gray).enhance(1.8)
-    gray = ImageEnhance.Sharpness(gray).enhance(1.5)
-    enhanced = gray.convert("RGB")
-
-    return [("original", original), ("enhanced", enhanced)]
-
-
-def run_easyocr(image: Image.Image):
-    image_array = np.array(image)
-    return ocr_reader.readtext(
-        image_array,
-        detail=1,
-        paragraph=False,
-        canvas_size=1800,
-        mag_ratio=1.2,
-        text_threshold=0.50,
-        low_text=0.20,
-        link_threshold=0.20,
-        width_ths=0.7,
-        height_ths=0.7,
-    )
-
-
-def normalize_ocr_text(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^\w\s]", "", text)
-    return text
-
-
-def extract_detections(results):
-    detections = []
-
-    for detection in results:
-        if len(detection) < 3:
-            continue
-
-        text = str(detection[1]).strip()
-
-        try:
-            confidence = float(detection[2])
-        except (TypeError, ValueError):
-            continue
-
-        if confidence < 0.20 or not text:
-            continue
-
-        position = detection[0]
-        min_x = min(point[0] for point in position)
-        min_y = min(point[1] for point in position)
-
-        detections.append({
-            "text": text,
-            "confidence": confidence,
-            "x": min_x,
-            "y": min_y,
-            "normalized": normalize_ocr_text(text),
-        })
-
-    return detections
-
-
-def deduplicate_detections(detections):
-    unique = {}
-
-    for item in detections:
-        key = item["normalized"]
-        if not key:
-            continue
-        if key not in unique or item["confidence"] > unique[key]["confidence"]:
-            unique[key] = item
-
-    return list(unique.values())
-
-
-def extract_text_from_image(image_path: str) -> str:
-    print("Starting OCR...")
-
-    image = Image.open(image_path)
-    prepared_images = prepare_ocr_images(image)
-    all_detections = []
-
-    for name, ocr_image in prepared_images:
-        try:
-            results = run_easyocr(ocr_image)
-            detections = extract_detections(results)
-            print(f"OCR pass '{name}': {len(detections)} regions")
-            all_detections.extend(detections)
-        except Exception as exc:
-            print(f"OCR pass '{name}' failed:", exc)
-
-    if not all_detections:
-        return ""
-
-    unique_detections = deduplicate_detections(all_detections)
-    unique_detections.sort(key=lambda item: (item["y"], item["x"]))
-
-    return "\n".join(item["text"] for item in unique_detections).strip()
-
-
 # ------------------ REMINDER CONFIRMATION FLOW ------------------
 
 async def _auto_confirm_job(context: ContextTypes.DEFAULT_TYPE):
@@ -447,7 +297,6 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_user_memory(update.effective_user.id)
     await update.message.reply_text("Conversation history reset.")
 
-
 async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args_text = " ".join(context.args)
 
@@ -472,8 +321,7 @@ async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     await offer_reminder(context, chat_id, user_id, description, event_time)
-
-
+    
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city = " ".join(context.args)
 
@@ -698,70 +546,30 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print("Telegram error:", context.error)
 
 
-# ------------------ TELEGRAM APPLICATION SETUP ------------------
+# ------------------ STARTUP ------------------
 
-telegram_app = Application.builder().token(BOT_TOKEN).build()
+async def on_startup(app: Application):
+    init_scheduler()
+
+
+# ------------------ APPLICATION (POLLING) ------------------
+
+telegram_app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("reset", reset_command))
 telegram_app.add_handler(CommandHandler("weather", weather_command))
-telegram_app.add_handler(CommandHandler("reminder", reminder_command))
 telegram_app.add_handler(MessageHandler(filters.PHOTO, image_handler))
 telegram_app.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler)
 )
+telegram_app.add_handler(CommandHandler("reminder", reminder_command))
 telegram_app.add_error_handler(error_handler)
 
 
-# ------------------ FASTAPI APP (WEBHOOK) ------------------
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    init_scheduler()
-    await telegram_app.initialize()
-    await telegram_app.start()
-
-    webhook_kwargs = {"url": f"{WEBHOOK_URL}{WEBHOOK_PATH}"}
-    if WEBHOOK_SECRET:
-        webhook_kwargs["secret_token"] = WEBHOOK_SECRET
-
-    await telegram_app.bot.set_webhook(**webhook_kwargs)
-    print(f"Webhook set to {WEBHOOK_URL}{WEBHOOK_PATH}")
-
-    yield
-
-    # Shutdown
-    await telegram_app.bot.delete_webhook()
-    await telegram_app.stop()
-    await telegram_app.shutdown()
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-@app.get("/")
-async def health_check():
-    return {"status": "ok", "message": "Bot is running"}
-
-
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    if WEBHOOK_SECRET:
-        received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if received_secret != WEBHOOK_SECRET:
-            return Response(status_code=403)
-
-    data = await request.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return Response(status_code=200)
-
-
 def main():
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
+    telegram_app.run_polling(drop_pending_updates=True)
+    
 
 if __name__ == "__main__":
     main()
