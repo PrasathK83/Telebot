@@ -8,9 +8,13 @@ import os
 import re
 import tempfile
 from collections import deque
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from reminders import init_scheduler, extract_event, schedule_reminders, parse_reminder_command
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
+import uvicorn
+
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -36,12 +40,15 @@ load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional, recommended
 
 if BOT_TOKEN:
     BOT_TOKEN = BOT_TOKEN.strip().strip('"').strip("'")
 if GROQ_API_KEY:
     GROQ_API_KEY = GROQ_API_KEY.strip().strip('"').strip("'")
+if WEBHOOK_URL:
+    WEBHOOK_URL = WEBHOOK_URL.strip().strip('"').strip("'").rstrip("/")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
@@ -50,8 +57,7 @@ if not GROQ_API_KEY:
 if not WEBHOOK_URL:
     raise RuntimeError("WEBHOOK_URL missing")
 
-# Remove trailing slash if present
-WEBHOOK_URL = WEBHOOK_URL.rstrip("/")
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
 groq_client = Groq(
     api_key=GROQ_API_KEY,
@@ -61,21 +67,10 @@ groq_client = Groq(
 
 
 # ------------------ OCR SETUP ------------------
-# EasyOCR model loading is slow (downloads + loads torch models). Doing this
-# at import time blocks uvicorn from binding the port, which makes Render's
-# port scan time out. So we lazy-load it on first use instead, inside a
-# thread executor.
 
-ocr_reader = None
-
-
-def get_ocr_reader():
-    global ocr_reader
-    if ocr_reader is None:
-        print("Loading EasyOCR (first use)...")
-        ocr_reader = easyocr.Reader(["en"], gpu=False)
-        print("EasyOCR loaded successfully.")
-    return ocr_reader
+print("Loading EasyOCR...")
+ocr_reader = easyocr.Reader(["en"], gpu=False)
+print("EasyOCR loaded successfully.")
 
 
 # ------------------ MEMORY ------------------
@@ -87,6 +82,14 @@ conversation_memory: dict[int, deque] = {}
 # ONE follow-up question about it. Cleared after that single answer.
 pending_ocr: dict[int, str] = {}
 
+# Holds an event awaiting yes/no confirmation before reminders are set.
+# Auto-confirms if the user doesn't reply within CONFIRM_TIMEOUT seconds.
+pending_confirmations: dict[int, dict] = {}
+CONFIRM_TIMEOUT = 15  # seconds
+
+CONFIRM_YES = re.compile(r"^\s*(yes|yeah|yep|sure|ok(ay)?|confirm|y)\s*$", re.IGNORECASE)
+CONFIRM_NO = re.compile(r"^\s*(no|nope|cancel|n)\s*$", re.IGNORECASE)
+
 
 def get_user_memory(user_id: int) -> deque:
     if user_id not in conversation_memory:
@@ -97,6 +100,7 @@ def get_user_memory(user_id: int) -> deque:
 def reset_user_memory(user_id: int):
     conversation_memory.pop(user_id, None)
     pending_ocr.pop(user_id, None)
+    pending_confirmations.pop(user_id, None)
 
 
 # ------------------ WEATHER NLP ------------------
@@ -158,6 +162,9 @@ Rules:
 - Answer naturally and helpfully.
 - If real-time data is provided, you MUST use it.
 - Do not hallucinate weather information.
+- You CAN set reminders automatically when the user mentions a date/time
+  for a meeting or event — this happens outside of you, so just
+  acknowledge it naturally if the user asks about it.
 - When weather data is provided, answer using that data.
 - Use Markdown formatting when it improves readability.
 - Do not unnecessarily make answers very long.
@@ -214,7 +221,7 @@ async def safe_reply(message, text: str):
         await message.reply_text(text)
 
 
-# ------------------ OCR PIPELINE ------------------
+# ------------------ OCR PIPELINE (from OCR bot) ------------------
 
 def prepare_ocr_images(image: Image.Image):
     image = ImageOps.exif_transpose(image).convert("RGB")
@@ -250,8 +257,7 @@ def prepare_ocr_images(image: Image.Image):
 
 def run_easyocr(image: Image.Image):
     image_array = np.array(image)
-    reader = get_ocr_reader()
-    return reader.readtext(
+    return ocr_reader.readtext(
         image_array,
         detail=1,
         paragraph=False,
@@ -342,20 +348,97 @@ def extract_text_from_image(image_path: str) -> str:
     return "\n".join(item["text"] for item in unique_detections).strip()
 
 
+# ------------------ REMINDER CONFIRMATION FLOW ------------------
+
+async def _auto_confirm_job(context: ContextTypes.DEFAULT_TYPE):
+    """Fired by JobQueue after CONFIRM_TIMEOUT seconds if the user hasn't
+    replied yes/no. Confirms and schedules the reminders automatically."""
+    user_id = context.job.data["user_id"]
+    pending = pending_confirmations.get(user_id)
+
+    # Only proceed if this is still the same pending request (not already
+    # answered or replaced by a newer one).
+    if not pending or pending.get("token") != context.job.data["token"]:
+        return
+
+    pending_confirmations.pop(user_id, None)
+    await _finalize_reminder(context, user_id, pending, auto=True)
+
+
+async def _finalize_reminder(context: ContextTypes.DEFAULT_TYPE, user_id: int, pending: dict, auto: bool):
+    labels = schedule_reminders(
+        context.job_queue, pending["chat_id"], pending["description"], pending["event_time"]
+    )
+    prefix = "⏱️ No response, so I went ahead and " if auto else "✅ "
+    if labels:
+        await context.bot.send_message(
+            chat_id=pending["chat_id"],
+            text=(
+                f"{prefix}set reminders for \"{pending['description']}\" "
+                f"({pending['event_time'].strftime('%a %b %d, %I:%M %p')}): "
+                f"{', '.join(labels)}."
+            ),
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=pending["chat_id"],
+            text=(
+                f"I found \"{pending['description']}\" at "
+                f"{pending['event_time'].strftime('%a %b %d, %I:%M %p')}, but it's "
+                f"already too late to set any reminder for it."
+            ),
+        )
+
+
+async def offer_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, description: str, event_time):
+    """Stores a pending confirmation, asks the user, and schedules an
+    auto-confirm fallback after CONFIRM_TIMEOUT seconds."""
+    token = f"{user_id}-{event_time.timestamp()}"
+    pending_confirmations[user_id] = {
+        "description": description,
+        "event_time": event_time,
+        "chat_id": chat_id,
+        "token": token,
+    }
+
+    context.job_queue.run_once(
+        _auto_confirm_job,
+        CONFIRM_TIMEOUT,
+        data={"user_id": user_id, "token": token},
+        name=f"autoconfirm-{token}",
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📌 I noticed \"{description}\" at "
+            f"{event_time.strftime('%a %b %d, %I:%M %p')}. "
+            f"Set reminders for it? (yes/no — I'll set them automatically "
+            f"in {CONFIRM_TIMEOUT}s if you don't reply)"
+        ),
+    )
+
+
 # ------------------ COMMAND HANDLERS ------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello!\n\n"
-        "I can chat, answer weather questions, and read text from images.\n\n"
+        "I can chat, answer weather questions, read text from images, "
+        "and set reminders for meetings/events you mention.\n\n"
         "You can send me:\n"
         "• Text messages (general chat)\n"
         "• Weather questions (e.g. \"will it rain in Chennai today?\")\n"
-        "• An image with text — send it, then ask ONE question about it "
-        "(e.g. \"summarize this\" or \"what does this say?\"). "
-        "I'll only answer about that image once, so make your question count!\n\n"
+        "• Something with a date/time in it (e.g. \"meeting tomorrow at 5pm\" "
+        "or \"registration in 10 min\") — I'll ask to confirm, then set "
+        "cascading reminders (1 day / 1 hr / 10 min / 5 min / 1 min before, "
+        "whichever fit).\n"
+        "• An image with text — send it, then ask ONE question about it. "
+        "If the image itself mentions a meeting/registration/deadline, "
+        "I'll offer to set a reminder for that too.\n\n"
         "Commands:\n"
         "/weather <city>\n"
+        "/reminder <time> <description> — e.g. /reminder 20 sec check oven\n"
         "/reset"
     )
 
@@ -363,6 +446,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_user_memory(update.effective_user.id)
     await update.message.reply_text("Conversation history reset.")
+
+
+async def reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args_text = " ".join(context.args)
+
+    if not args_text:
+        await update.message.reply_text(
+            "Usage: /reminder <time> <description>\n"
+            "e.g. /reminder 20 sec check oven\n"
+            "     /reminder 2 min submit form\n"
+            "     /reminder 1 hour team call"
+        )
+        return
+
+    result = parse_reminder_command(args_text)
+    if not result:
+        await update.message.reply_text(
+            "Couldn't understand that. Usage: /reminder <time> <description>\n"
+            "e.g. /reminder 20 sec check oven"
+        )
+        return
+
+    description, event_time = result
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    await offer_reminder(context, chat_id, user_id, description, event_time)
 
 
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -381,6 +490,7 @@ async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
     processing_message = await update.message.reply_text(
         "Reading text from your image..."
@@ -421,6 +531,13 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "after that you'll need to send the image again for another question.)"
         )
 
+        # Check if the image itself mentions a schedulable event
+        # (meeting, registration, deadline, etc.) and offer a reminder.
+        event = extract_event(extracted_text)
+        if event:
+            description, event_time = event
+            await offer_reminder(context, chat_id, user_id, description, event_time)
+
     except Exception as exc:
         print("Image processing failed:", exc)
         try:
@@ -448,6 +565,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
     if is_owner_query(user_message):
         await update.message.reply_text(
@@ -456,6 +574,20 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     loop = asyncio.get_running_loop()
+
+    # ---------- REMINDER CONFIRMATION REPLY ----------
+    if user_id in pending_confirmations:
+        if CONFIRM_YES.match(user_message):
+            pending = pending_confirmations.pop(user_id)
+            await _finalize_reminder(context, user_id, pending, auto=False)
+            return
+        if CONFIRM_NO.match(user_message):
+            pending_confirmations.pop(user_id, None)
+            await update.message.reply_text("Okay, I won't set a reminder for that.")
+            return
+        # Any other message: leave the pending confirmation active (it
+        # will still auto-confirm on its own timer) and fall through so
+        # the message gets handled normally below.
 
     # ---------- ONE-TIME OCR FOLLOW-UP ----------
     if user_id in pending_ocr:
@@ -498,6 +630,17 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply(update.message, reply)
         return  # do not fall through to normal chat/weather logic
 
+    # ---------- SCHEDULE / REMINDER DETECTION ----------
+    # Checked before weather, so "meeting tomorrow at 5" isn't hijacked by
+    # a stray "tomorrow" match in the weather-keyword check.
+    event = extract_event(user_message)
+    if event:
+        description, event_time = event
+        await offer_reminder(context, chat_id, user_id, description, event_time)
+        # Falls through so the message still gets a normal chat/weather
+        # reply too. Add a `return` here if you'd rather ONLY ask about
+        # the reminder and skip the normal AI reply for schedule messages.
+
     # ---------- NORMAL CHAT / WEATHER ----------
     memory = get_user_memory(user_id)
     memory.append({"role": "user", "content": user_message})
@@ -506,28 +649,32 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_weather_query(user_message):
         city = extract_city(user_message)
+        print(f"[weather-nlp] extracted city: {city!r} from: {user_message!r}")
 
         if city:
-            weather = await loop.run_in_executor(None, fetch_weather, city)
-            messages.append({
-                "role": "system",
-                "content": f"REAL-TIME WEATHER DATA FOR {city}:\n{weather}",
-            })
-
+            try:
+                weather = await loop.run_in_executor(None, fetch_weather, city)
+                messages.append({
+                    "role": "system",
+                    "content": f"REAL-TIME WEATHER DATA FOR {city}:\n{weather}",
+                    })
+            except Exception as exc:
+                print(f"[weather-nlp] fetch_weather failed for {city!r}:", exc)
+            # continue without weather data rather than failing the whole reply
     messages.extend(list(memory))
 
     try:
         response = await loop.run_in_executor(
-            None,
-            lambda: groq_client.chat.completions.create(
-                model="openai/gpt-oss-120b",
-                messages=messages,
-                temperature=0.4,
-                max_completion_tokens=1024,
-                top_p=0.95,
-                stream=False,
-            ),
-        )
+                None,
+                lambda: groq_client.chat.completions.create(
+                    model="openai/gpt-oss-120b",
+                    messages=messages,
+                    temperature=0.4,
+                    max_completion_tokens=1024,
+                    top_p=0.95,
+                    stream=False,
+                ),
+            )
 
         reply = response.choices[0].message.content or (
             "Sorry, I couldn't generate a response."
@@ -551,26 +698,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print("Telegram error:", context.error)
 
 
-# ------------------ FASTAPI ------------------
-
-app = FastAPI()
-
-
-@app.get("/")
-async def home():
-    return {
-        "status": "running",
-        "message": "Telegram bot is active",
-    }
-
-
-# ------------------ TELEGRAM APPLICATION ------------------
+# ------------------ TELEGRAM APPLICATION SETUP ------------------
 
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("reset", reset_command))
 telegram_app.add_handler(CommandHandler("weather", weather_command))
+telegram_app.add_handler(CommandHandler("reminder", reminder_command))
 telegram_app.add_handler(MessageHandler(filters.PHOTO, image_handler))
 telegram_app.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler)
@@ -578,42 +713,55 @@ telegram_app.add_handler(
 telegram_app.add_error_handler(error_handler)
 
 
-# ------------------ STARTUP / SHUTDOWN ------------------
+# ------------------ FASTAPI APP (WEBHOOK) ------------------
 
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    init_scheduler()
     await telegram_app.initialize()
     await telegram_app.start()
 
-    webhook_url = f"{WEBHOOK_URL}/webhook"
-    await telegram_app.bot.set_webhook(webhook_url)
+    webhook_kwargs = {"url": f"{WEBHOOK_URL}{WEBHOOK_PATH}"}
+    if WEBHOOK_SECRET:
+        webhook_kwargs["secret_token"] = WEBHOOK_SECRET
 
-    print(f"Telegram webhook registered: {webhook_url}")
+    await telegram_app.bot.set_webhook(**webhook_kwargs)
+    print(f"Webhook set to {WEBHOOK_URL}{WEBHOOK_PATH}")
 
+    yield
 
-@app.on_event("shutdown")
-async def on_shutdown():
+    # Shutdown
+    await telegram_app.bot.delete_webhook()
     await telegram_app.stop()
     await telegram_app.shutdown()
 
 
-# ------------------ WEBHOOK ------------------
+app = FastAPI(lifespan=lifespan)
 
-@app.post("/webhook")
+
+@app.get("/")
+async def health_check():
+    return {"status": "ok", "message": "Bot is running"}
+
+
+@app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
+    if WEBHOOK_SECRET:
+        received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if received_secret != WEBHOOK_SECRET:
+            return Response(status_code=403)
+
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
-    return {"ok": True}
+    return Response(status_code=200)
 
 
-# ------------------ LOCAL / RENDER ENTRYPOINT ------------------
-# On Render, set the start command to:
-#   uvicorn bot_webhook:app --host 0.0.0.0 --port $PORT
-# This __main__ block is only a convenience for running locally.
+def main():
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
 
 if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    main()
