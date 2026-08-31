@@ -6,6 +6,7 @@ if sys.platform.startswith("win"):
 
 import os
 import re
+from collections import deque
 from dotenv import load_dotenv
 from reminders import init_scheduler, extract_event, schedule_reminders, parse_reminder_command
 from telegram import Update
@@ -51,8 +52,6 @@ groq_client = Groq(
 
 WINDOW_SIZE = 5
 conversation_memory: dict[int, deque] = {}
-
-from collections import deque
 
 # Holds an event awaiting yes/no confirmation before reminders are set.
 # Auto-confirms if the user doesn't reply within CONFIRM_TIMEOUT seconds.
@@ -424,15 +423,35 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print("Telegram error:", context.error)
 
 
-# ------------------ STARTUP ------------------
+# ------------------ WEBHOOK SETUP (FastAPI + Render) ------------------
+#
+# Render is a web service, so it expects something listening on $PORT.
+# Instead of run_polling(), we run the bot as a FastAPI app and register
+# a webhook with Telegram that points at this service's public URL.
+#
+# Required env vars:
+#   BOT_TOKEN     - already required above
+#   WEBHOOK_URL   - your Render service's public base URL,
+#                   e.g. https://your-app.onrender.com
+#                   (no trailing slash)
+#   WEBHOOK_SECRET (optional) - a random string used to validate that
+#                   incoming requests really came from Telegram.
 
-async def on_startup(app: Application):
-    init_scheduler()
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Response
+
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+if WEBHOOK_URL:
+    WEBHOOK_URL = WEBHOOK_URL.strip().strip('"').strip("'").rstrip("/")
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
+# Path Telegram will POST updates to. Includes the bot token so random
+# scanners hitting your domain can't spoof updates.
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
 
-# ------------------ APPLICATION (POLLING) ------------------
-
-telegram_app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("reset", reset_command))
@@ -451,9 +470,55 @@ telegram_app.add_handler(CommandHandler("reminder", reminder_command))
 telegram_app.add_error_handler(error_handler)
 
 
-def main():
-    telegram_app.run_polling(drop_pending_updates=True)
-    
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_scheduler()
 
-if __name__ == "__main__":
-    main()
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    if WEBHOOK_URL:
+        webhook_kwargs = {
+            "url": f"{WEBHOOK_URL}{WEBHOOK_PATH}",
+            "drop_pending_updates": True,
+            "allowed_updates": Update.ALL_TYPES,
+        }
+        if WEBHOOK_SECRET:
+            webhook_kwargs["secret_token"] = WEBHOOK_SECRET
+
+        await telegram_app.bot.set_webhook(**webhook_kwargs)
+        print(f"Webhook set to {WEBHOOK_URL}{WEBHOOK_PATH}")
+    else:
+        print(
+            "WARNING: WEBHOOK_URL is not set — Telegram won't be able to "
+            "deliver updates. Set WEBHOOK_URL to your Render service's "
+            "public URL."
+        )
+
+    yield
+
+    await telegram_app.bot.delete_webhook()
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/")
+async def health_check():
+    """Simple endpoint so Render's port scan / uptime checks succeed."""
+    return {"status": "ok"}
+
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    if WEBHOOK_SECRET:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if header_secret != WEBHOOK_SECRET:
+            return Response(status_code=401)
+
+    data = await request.json()
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return Response(status_code=200)
