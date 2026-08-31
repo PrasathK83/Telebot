@@ -462,7 +462,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await loop.run_in_executor(
                 None,
                 lambda: groq_client.chat.completions.create(
-                    model="openai/gpt-oss-20b",
+                    model="openai/gpt-oss-120b",
                     messages=messages,
                     temperature=0.4,
                     max_completion_tokens=1024,
@@ -570,7 +570,14 @@ async def lifespan(_: FastAPI):
 
     yield
 
-    await telegram_app.bot.delete_webhook()
+    # NOTE: We deliberately do NOT call delete_webhook() here.
+    # Render's free tier spins this service down after idle time and
+    # spins it back up on the next incoming request. If we deleted the
+    # webhook on every shutdown, Telegram would have nowhere to send
+    # updates, and there would be no way to wake the service back up —
+    # exactly the bug that caused messages to go unanswered. Leaving the
+    # webhook registered means Telegram just retries delivery until the
+    # instance wakes up.
     await telegram_app.stop()
     await telegram_app.shutdown()
 
