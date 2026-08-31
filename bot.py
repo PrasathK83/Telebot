@@ -6,6 +6,7 @@ if sys.platform.startswith("win"):
 
 import os
 import re
+import tempfile
 from collections import deque
 from dotenv import load_dotenv
 from reminders import init_scheduler, extract_event, schedule_reminders, parse_reminder_command
@@ -255,6 +256,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "You can send me:\n"
         "• Text messages (general chat)\n"
         "• Weather questions (e.g. \"will it rain in Chennai today?\")\n"
+        "• Voice messages — I'll transcribe them and send back the text\n"
         "• Something with a date/time in it (e.g. \"meeting tomorrow at 5pm\" "
         "or \"registration in 10 min\") — I'll ask to confirm, then set "
         "cascading reminders (1 day / 1 hr / 10 min / 5 min / 1 min before, "
@@ -310,16 +312,84 @@ async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------ UNSUPPORTED MEDIA HANDLER ------------------
 
 UNSUPPORTED_MEDIA_MESSAGE = (
-    "I'm not able to look at images, videos, or voice messages right now — "
-    "I can only work with text. Feel free to type out what you'd like help with!"
+    "I'm not able to look at images or videos right now — "
+    "I can only work with text (and voice messages). Feel free to type out "
+    "what you'd like help with!"
 )
 
 
 async def unsupported_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles photos, videos, voice notes, and other media the bot can't
-    process. Replies with a gentle, non-alarming message so the user isn't
-    left confused or made to feel at fault."""
+    """Handles photos, videos, and other media the bot can't process.
+    Replies with a gentle, non-alarming message so the user isn't left
+    confused or made to feel at fault."""
     await update.message.reply_text(UNSUPPORTED_MEDIA_MESSAGE)
+
+
+# ------------------ VOICE / AUDIO TRANSCRIPTION HANDLER ------------------
+
+VOICE_TRANSCRIBE_FAILED_MESSAGE = (
+    "Sorry, I couldn't transcribe that voice message. Please try again, "
+    "or send it as text instead."
+)
+
+
+def _transcribe_audio_file(file_path: str) -> str:
+    """Runs Groq's Whisper model on the given local audio file and returns
+    the transcribed text. Executed in a thread pool since it's a blocking
+    network call."""
+    with open(file_path, "rb") as file:
+        transcription = groq_client.audio.transcriptions.create(
+            file=(os.path.basename(file_path), file.read()),
+            model="whisper-large-v3",
+            temperature=0,
+            response_format="verbose_json",
+        )
+    return transcription.text
+
+
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Downloads an incoming voice note or audio file, transcribes it via
+    Groq Whisper, and replies with the transcription only (no LLM reply)."""
+    processing_message = await update.message.reply_text("Transcribing your voice message...")
+
+    temp_path = None
+
+    try:
+        media = update.message.voice or update.message.audio
+        telegram_file = await context.bot.get_file(media.file_id)
+
+        # Preserve a sensible extension so Whisper can infer the format.
+        suffix = ".ogg" if update.message.voice else ".mp3"
+        temp_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        temp_path = temp_file.name
+        temp_file.close()
+
+        await telegram_file.download_to_drive(temp_path)
+
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, _transcribe_audio_file, temp_path)
+
+        if not text or not text.strip():
+            await processing_message.edit_text(
+                "I couldn't detect any speech in that voice message."
+            )
+            return
+
+        await processing_message.edit_text(text.strip())
+
+    except Exception as exc:
+        print("Voice transcription failed:", exc)
+        try:
+            await processing_message.edit_text(VOICE_TRANSCRIBE_FAILED_MESSAGE)
+        except Exception:
+            pass
+
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 # ------------------ CHAT HANDLER ------------------
@@ -392,7 +462,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await loop.run_in_executor(
                 None,
                 lambda: groq_client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
+                    model="openai/gpt-oss-20b",
                     messages=messages,
                     temperature=0.4,
                     max_completion_tokens=1024,
@@ -457,9 +527,12 @@ telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("reset", reset_command))
 telegram_app.add_handler(CommandHandler("weather", weather_command))
 telegram_app.add_handler(
+    MessageHandler(filters.VOICE | filters.AUDIO, voice_handler)
+)
+telegram_app.add_handler(
     MessageHandler(
-        filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO
-        | filters.VIDEO_NOTE | filters.ANIMATION | filters.Document.ALL,
+        filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE
+        | filters.ANIMATION | filters.Document.ALL,
         unsupported_media_handler,
     )
 )
