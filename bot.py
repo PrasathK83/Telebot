@@ -6,8 +6,6 @@ if sys.platform.startswith("win"):
 
 import os
 import re
-import tempfile
-from collections import deque
 from dotenv import load_dotenv
 from reminders import init_scheduler, extract_event, schedule_reminders, parse_reminder_command
 from telegram import Update
@@ -22,7 +20,6 @@ from telegram.ext import (
 
 from groq import Groq
 from weather import fetch_weather
-from ocr import extract_text_from_image
 
 
 # ------------------ ENV ------------------
@@ -55,9 +52,7 @@ groq_client = Groq(
 WINDOW_SIZE = 5
 conversation_memory: dict[int, deque] = {}
 
-# Holds OCR text extracted from a user's last image, waiting for their
-# ONE follow-up question about it. Cleared after that single answer.
-pending_ocr: dict[int, str] = {}
+from collections import deque
 
 # Holds an event awaiting yes/no confirmation before reminders are set.
 # Auto-confirms if the user doesn't reply within CONFIRM_TIMEOUT seconds.
@@ -76,7 +71,6 @@ def get_user_memory(user_id: int) -> deque:
 
 def reset_user_memory(user_id: int):
     conversation_memory.pop(user_id, None)
-    pending_ocr.pop(user_id, None)
     pending_confirmations.pop(user_id, None)
 
 
@@ -145,23 +139,6 @@ Rules:
 - When weather data is provided, answer using that data.
 - Use Markdown formatting when it improves readability.
 - Do not unnecessarily make answers very long.
-
-Security:
-- If asked about your creator or owner reply:
-  "That information is hidden due to security policies."
-"""
-
-OCR_SYSTEM_PROMPT = """
-You are a professional AI assistant answering a question about text that
-was extracted (via OCR) from an image the user just sent.
-
-Rules:
-- The OCR text may contain errors, missing spaces, or misreads. Use your
-  best judgement to interpret it.
-- Answer ONLY the user's specific question about this image content.
-- Be concise and directly address what was asked.
-- If the OCR text does not contain enough information to answer, say so
-  honestly instead of making things up.
 
 Security:
 - If asked about your creator or owner reply:
@@ -274,18 +251,15 @@ async def offer_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello!\n\n"
-        "I can chat, answer weather questions, read text from images, "
-        "and set reminders for meetings/events you mention.\n\n"
+        "I can chat, answer weather questions, and set reminders for "
+        "meetings/events you mention.\n\n"
         "You can send me:\n"
         "• Text messages (general chat)\n"
         "• Weather questions (e.g. \"will it rain in Chennai today?\")\n"
         "• Something with a date/time in it (e.g. \"meeting tomorrow at 5pm\" "
         "or \"registration in 10 min\") — I'll ask to confirm, then set "
         "cascading reminders (1 day / 1 hr / 10 min / 5 min / 1 min before, "
-        "whichever fit).\n"
-        "• An image with text — send it, then ask ONE question about it. "
-        "If the image itself mentions a meeting/registration/deadline, "
-        "I'll offer to set a reminder for that too.\n\n"
+        "whichever fit).\n\n"
         "Commands:\n"
         "/weather <city>\n"
         "/reminder <time> <description> — e.g. /reminder 20 sec check oven\n"
@@ -334,74 +308,19 @@ async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(result)
 
 
-# ------------------ IMAGE HANDLER (OCR intake) ------------------
+# ------------------ UNSUPPORTED MEDIA HANDLER ------------------
 
-async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+UNSUPPORTED_MEDIA_MESSAGE = (
+    "I'm not able to look at images, videos, or voice messages right now — "
+    "I can only work with text. Feel free to type out what you'd like help with!"
+)
 
-    processing_message = await update.message.reply_text(
-        "Reading text from your image..."
-    )
 
-    temp_path = None
-
-    try:
-        photo = update.message.photo[-1]
-        telegram_file = await context.bot.get_file(photo.file_id)
-
-        temp_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        temp_path = temp_file.name
-        temp_file.close()
-
-        await telegram_file.download_to_drive(temp_path)
-
-        loop = asyncio.get_running_loop()
-        extracted_text = await loop.run_in_executor(
-            None, extract_text_from_image, temp_path
-        )
-
-        if not extracted_text:
-            await processing_message.edit_text(
-                "I couldn't detect any text in this image. "
-                "Try sending a clearer, higher-resolution image."
-            )
-            return
-
-        # Store for exactly one follow-up question, overwriting any
-        # previous pending image for this user.
-        pending_ocr[user_id] = extracted_text
-
-        await processing_message.edit_text(
-            "Got it — I've read the text from your image.\n\n"
-            "What would you like to know about it? "
-            "(This applies to this image only, and I'll answer just once — "
-            "after that you'll need to send the image again for another question.)"
-        )
-
-        # Check if the image itself mentions a schedulable event
-        # (meeting, registration, deadline, etc.) and offer a reminder.
-        event = extract_event(extracted_text)
-        if event:
-            description, event_time = event
-            await offer_reminder(context, chat_id, user_id, description, event_time)
-
-    except Exception as exc:
-        print("Image processing failed:", exc)
-        try:
-            await processing_message.edit_text(
-                "Sorry, I couldn't process this image. "
-                "Please try again with a clearer or higher-resolution image."
-            )
-        except Exception:
-            pass
-
-    finally:
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+async def unsupported_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles photos, videos, voice notes, and other media the bot can't
+    process. Replies with a gentle, non-alarming message so the user isn't
+    left confused or made to feel at fault."""
+    await update.message.reply_text(UNSUPPORTED_MEDIA_MESSAGE)
 
 
 # ------------------ CHAT HANDLER ------------------
@@ -436,47 +355,6 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Any other message: leave the pending confirmation active (it
         # will still auto-confirm on its own timer) and fall through so
         # the message gets handled normally below.
-
-    # ---------- ONE-TIME OCR FOLLOW-UP ----------
-    if user_id in pending_ocr:
-        ocr_text = pending_ocr.pop(user_id)  # consumed — one-time only
-
-        messages = [
-            {"role": "system", "content": OCR_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"OCR-extracted text from the image:\n"
-                    f"---\n{ocr_text}\n---\n\n"
-                    f"My question about this image: {user_message}"
-                ),
-            },
-        ]
-
-        try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: groq_client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
-                    messages=messages,
-                    temperature=0.4,
-                    max_completion_tokens=1024,
-                    top_p=0.95,
-                    stream=False,
-                ),
-            )
-
-            reply = response.choices[0].message.content or (
-                "Sorry, I couldn't generate a response."
-            )
-            reply = convert_markdown_for_telegram(reply)
-
-        except Exception as exc:
-            print("OCR-answer Groq call failed:", exc)
-            reply = "Sorry, I couldn't process your question about that image."
-
-        await safe_reply(update.message, reply)
-        return  # do not fall through to normal chat/weather logic
 
     # ---------- SCHEDULE / REMINDER DETECTION ----------
     # Checked before weather, so "meeting tomorrow at 5" isn't hijacked by
@@ -559,7 +437,13 @@ telegram_app = Application.builder().token(BOT_TOKEN).post_init(on_startup).buil
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("reset", reset_command))
 telegram_app.add_handler(CommandHandler("weather", weather_command))
-telegram_app.add_handler(MessageHandler(filters.PHOTO, image_handler))
+telegram_app.add_handler(
+    MessageHandler(
+        filters.PHOTO | filters.VIDEO | filters.VOICE | filters.AUDIO
+        | filters.VIDEO_NOTE | filters.ANIMATION | filters.Document.ALL,
+        unsupported_media_handler,
+    )
+)
 telegram_app.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, chat_handler)
 )
