@@ -465,8 +465,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"[weather-nlp] fetch_weather failed for {city!r}:", exc)
             # continue without weather data rather than failing the whole reply
     messages.extend(list(memory))
-
-        try:
+    try:
         # Gemini has no separate "system" role — fold system messages into
         # the first turn, and remap the rest into Gemini's expected shape.
         system_texts = [m["content"] for m in messages if m["role"] == "system"]
