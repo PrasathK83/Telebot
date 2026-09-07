@@ -162,6 +162,7 @@ def convert_markdown_for_telegram(text: str) -> str:
 
     for line in lines:
         stripped = line.strip()
+        leading_spaces = line[: len(line) - len(line.lstrip(" "))]
 
         if stripped.startswith("### "):
             result.append(f"*{stripped[4:].strip()}*")
@@ -169,6 +170,13 @@ def convert_markdown_for_telegram(text: str) -> str:
             result.append(f"*{stripped[3:].strip()}*")
         elif stripped.startswith("# "):
             result.append(f"*{stripped[2:].strip()}*")
+        elif stripped.startswith("* ") or stripped.startswith("- "):
+            # Bullet list marker. Convert to a plain bullet char BEFORE the
+            # bold pass below, so "* *Item:*" doesn't leave two asterisks
+            # sitting next to each other — Telegram's legacy Markdown mode
+            # can't parse adjacent/nested entities and will reject the
+            # entire message's formatting if it sees that.
+            result.append(f"{leading_spaces}• {stripped[2:].strip()}")
         else:
             result.append(line)
 
@@ -178,6 +186,15 @@ def convert_markdown_for_telegram(text: str) -> str:
     # Gemini (like most models) outputs standard Markdown with **bold**,
     # so convert that to Telegram's single-asterisk bold syntax.
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+
+    # Safety net: legacy Markdown requires a balanced, non-nested count of
+    # each entity char. If something still results in an odd number of
+    # asterisks/underscores/backticks, parsing will fail and Telegram will
+    # reject the whole message. In that case strip them rather than risk
+    # a failed send (safe_reply's fallback would show raw asterisks).
+    for char in ("*", "_", "`"):
+        if text.count(char) % 2 != 0:
+            text = text.replace(char, "")
 
     return text
 
