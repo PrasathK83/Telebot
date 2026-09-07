@@ -172,7 +172,14 @@ def convert_markdown_for_telegram(text: str) -> str:
         else:
             result.append(line)
 
-    return "\n".join(result)
+    text = "\n".join(result)
+
+    # Telegram's legacy Markdown mode uses single * for bold, not **.
+    # Gemini (like most models) outputs standard Markdown with **bold**,
+    # so convert that to Telegram's single-asterisk bold syntax.
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+
+    return text
 
 
 async def safe_reply(message, text: str):
@@ -465,6 +472,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"[weather-nlp] fetch_weather failed for {city!r}:", exc)
             # continue without weather data rather than failing the whole reply
     messages.extend(list(memory))
+
     try:
         # Gemini has no separate "system" role — fold system messages into
         # the first turn, and remap the rest into Gemini's expected shape.
@@ -482,7 +490,7 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await loop.run_in_executor(
             None,
             lambda: gemini_client.models.generate_content(
-                model="gemini-flash-lite-latest",
+                model=GEMINI_MODEL,
                 contents=gemini_contents,
                 config={
                     "temperature": 0.4,
