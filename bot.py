@@ -32,7 +32,14 @@ load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    GEMINI_API_KEY = GEMINI_API_KEY.strip().strip('"').strip("'")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY missing")
 
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 if BOT_TOKEN:
     BOT_TOKEN = BOT_TOKEN.strip().strip('"').strip("'")
 if GROQ_API_KEY:
