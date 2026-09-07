@@ -1,7 +1,11 @@
 import re
-from datetime import datetime, timedelta
 from telegram.ext import ContextTypes
+from datetime import datetime, timedelta, timezone
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist():
+    return datetime.now(IST)
 # ------------------ CONFIG ------------------
 
 # Cascading offsets — schedule_reminders will only use whichever of these
@@ -56,7 +60,7 @@ def extract_event(text: str):
     if not EVENT_HINTS.search(text):
         return None
 
-    now = datetime.now()
+    now = now_ist()
 
     # ---- Relative: "in X sec/min/hr/day" ----
         # ---- Relative: "in/for/after X sec/min/hr/day" ----
