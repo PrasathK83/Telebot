@@ -22,6 +22,7 @@ from telegram.ext import (
 
 from groq import Groq
 from weather import fetch_weather
+from google import genai
 
 
 # ------------------ ENV ------------------
@@ -458,28 +459,40 @@ async def chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # continue without weather data rather than failing the whole reply
     messages.extend(list(memory))
 
-    try:
-        response = await loop.run_in_executor(
-                None,
-                lambda: groq_client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
-                    messages=messages,
-                    temperature=0.4,
-                    max_completion_tokens=1024,
-                    top_p=0.95,
-                    stream=False,
-                ),
-            )
+        try:
+        # Gemini has no separate "system" role — fold system messages into
+        # the first turn, and remap the rest into Gemini's expected shape.
+        system_texts = [m["content"] for m in messages if m["role"] == "system"]
+        turns = [m for m in messages if m["role"] != "system"]
 
-        reply = response.choices[0].message.content or (
-            "Sorry, I couldn't generate a response."
+        gemini_contents = []
+        for i, m in enumerate(turns):
+            role = "user" if m["role"] == "user" else "model"
+            text = m["content"]
+            if i == 0 and system_texts and role == "user":
+                text = "\n\n".join(system_texts) + "\n\n" + text
+            gemini_contents.append({"role": role, "parts": [{"text": text}]})
+
+        response = await loop.run_in_executor(
+            None,
+            lambda: gemini_client.models.generate_content(
+                model="gemini-flash-lite-latest",
+                contents=gemini_contents,
+                config={
+                    "temperature": 0.4,
+                    "top_p": 0.95,
+                    "max_output_tokens": 1024,
+                },
+            ),
         )
+
+        reply = response.text or "Sorry, I couldn't generate a response."
         reply = convert_markdown_for_telegram(reply)
 
         memory.append({"role": "assistant", "content": reply})
 
     except Exception as exc:
-        print("Groq call failed:", exc)
+        print("Model call failed:", exc)
 
         if memory and memory[-1]["role"] == "user":
             memory.pop()
