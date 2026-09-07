@@ -4,10 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+
 def now_ist():
     return datetime.now(IST)
-# ------------------ CONFIG ------------------
 
+
+# ------------------ CONFIG ------------------
 # Cascading offsets — schedule_reminders will only use whichever of these
 # actually fit before the event; if none fit (event is under a minute
 # away), it falls back to a single reminder right at the event time.
@@ -18,27 +20,22 @@ REMINDER_OFFSETS = [
     ("5 minutes before", timedelta(minutes=5)),
     ("1 minute before", timedelta(minutes=1)),
 ]
-
 EVENT_HINTS = re.compile(
     r"\b(meeting|call|appointment|event|reminder|remind me|schedule|"
     r"registration|deadline|due|interview|class|exam|submission)\b",
     re.IGNORECASE,
 )
-
 RELATIVE_PATTERN = re.compile(
     r"\b(?:in|for|after)\s+(\d+)\s*"
     r"(sec(?:ond)?s?|min(?:ute)?s?|hrs?|hours?|days?)\b",
     re.IGNORECASE,
 )
-
 GENERIC_REMINDER_WORDS = re.compile(
     r"\b(set (a )?reminder|remind me|reminder)\b", re.IGNORECASE
 )
-
 TIME_PATTERN = re.compile(
     r"\bat\s+(\d{1,2})(:(\d{2}))?\s*(am|pm)?\b", re.IGNORECASE
 )
-
 TOMORROW_PATTERN = re.compile(r"\btomorrow\b", re.IGNORECASE)
 
 
@@ -62,13 +59,11 @@ def extract_event(text: str):
 
     now = now_ist()
 
-    # ---- Relative: "in X sec/min/hr/day" ----
-        # ---- Relative: "in/for/after X sec/min/hr/day" ----
+    # ---- Relative: "in/for/after X sec/min/hr/day" ----
     match = RELATIVE_PATTERN.search(text)
     if match:
         amount = int(match.group(1))
         unit = match.group(2).lower()
-
         if unit.startswith("sec"):
             delta = timedelta(seconds=amount)
         elif unit.startswith("min"):
@@ -77,15 +72,12 @@ def extract_event(text: str):
             delta = timedelta(hours=amount)
         else:
             delta = timedelta(days=amount)
-
         event_time = now + delta
-
         # Strip the matched time phrase
         description = (text[:match.start()] + text[match.end():]).strip(" -:,.")
         # Strip generic filler like "set reminder" / "remind me" so a bare
         # "set reminder for 2 min" doesn't leave junk as the description
         description = GENERIC_REMINDER_WORDS.sub("", description).strip(" -:,.")
-
         return (description or "your reminder"), event_time
 
     # ---- Absolute: "[tomorrow] at H(:MM)(am/pm)" ----
@@ -93,28 +85,23 @@ def extract_event(text: str):
     if time_match:
         day_match = TOMORROW_PATTERN.search(text)
         day_offset = 1 if day_match else 0
-
         hour = int(time_match.group(1))
         minute = int(time_match.group(3)) if time_match.group(3) else 0
         meridian = (time_match.group(4) or "").lower()
-
         if meridian == "pm" and hour != 12:
             hour += 12
         if meridian == "am" and hour == 12:
             hour = 0
-
         event_time = (now + timedelta(days=day_offset)).replace(
             hour=hour, minute=minute, second=0, microsecond=0
         )
         if event_time <= now:
             event_time += timedelta(days=1)
-
         description = text
         if day_match:
             description = description.replace(day_match.group(0), "")
         description = description.replace(time_match.group(0), "")
         description = description.strip(" -:,.")
-
         return (description or "your event"), event_time
 
     return None
@@ -134,6 +121,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------ SCHEDULING ------------------
+
 def parse_reminder_command(args_text: str):
     """
     Parses the raw argument string from /reminder command, e.g.
@@ -161,8 +149,9 @@ def parse_reminder_command(args_text: str):
     else:
         delta = timedelta(days=amount)
 
-    event_time = datetime.now() + delta
+    event_time = now_ist() + delta
     return description, event_time
+
 
 def schedule_reminders(job_queue, chat_id: int, description: str, event_time: datetime):
     """
@@ -171,7 +160,7 @@ def schedule_reminders(job_queue, chat_id: int, description: str, event_time: da
     a single reminder right at event_time instead.
     Returns the list of labels actually scheduled.
     """
-    now = datetime.now()
+    now = now_ist()
     labels_set = []
 
     for label, offset in REMINDER_OFFSETS:
